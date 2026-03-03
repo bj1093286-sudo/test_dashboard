@@ -636,7 +636,187 @@ if run:
 
     for insight in insights:
         st.markdown(f"- {insight}")
+    # -----------------------------------------------
+    # 5-4) 자동 개선안(Action Plan)
+    # -----------------------------------------------
+    st.subheader("5-4) 자동 개선안(Action Plan) — 대시보드 기반 즉시 실행안")
 
+    def make_actions(item_stats: pd.DataFrame, cfg: dict) -> pd.DataFrame:
+        actions = []
+        for _, r in item_stats.iterrows():
+            q = r["q"]
+            p = r["p_value"]
+            pb = r["pbis"]
+            D = r["D"]
+            grade = r["risk_grade"]
+            cause = r.get("cause_type", "")
+
+            # 기본 액션 템플릿
+            if str(cause).startswith("🔴"):
+                priority = "P0(즉시)"
+                owner = "출제/검수"
+                action = (
+                    "정답키/복수정답/오탈자/지문 모호성/부분점수 기준 즉시 점검 → "
+                    "필요 시 '문항 무효' 또는 재채점 정책 결정"
+                )
+                deliverable = "검증 체크리스트 + 조치 결과(무효/수정/유지)"
+            elif str(cause).startswith("🟠"):
+                priority = "P1(이번 회차 내)"
+                owner = "출제/교육"
+                action = (
+                    "문항 표현/범위/선택지 매력도(오답 유혹) 개선 → "
+                    "교육 커버리지(강의/자료) 매칭 확인 후 재출제"
+                )
+                deliverable = "수정안(지문/보기) + 교육매칭 근거"
+            elif str(cause).startswith("🟡"):
+                priority = "P1(이번 회차 내)"
+                owner = "교육"
+                action = (
+                    "해당 영역 보강 교육(10~15분 마이크로러닝) + 대표 오답유형/해설 공유 → "
+                    "다음 시험에서 재측정"
+                )
+                deliverable = "보강자료(해설/예시) + 재측정 계획"
+            elif str(cause).startswith("🔵"):
+                priority = "P2(다음 회차)"
+                owner = "출제"
+                action = "난이도 상향 또는 대체문항 투입(상위권 변별 목적)"
+                deliverable = "대체문항 1~2개 + 난이도 조정 근거"
+            else:
+                # 정상은 액션 최소화
+                if grade in ["WARN", "HOLD"]:
+                    priority = "P2(모니터링)"
+                    owner = "운영"
+                    action = "지표 모니터링 지속(다음 회차 동일 패턴 여부 확인)"
+                    deliverable = "모니터링 로그"
+                else:
+                    continue
+
+            actions.append({
+                "우선순위": priority,
+                "문항": q,
+                "등급": grade,
+                "p(정답률)": p,
+                "pbis": pb,
+                "D": D,
+                "원인": cause,
+                "담당": owner,
+                "개선 액션": action,
+                "산출물": deliverable,
+            })
+
+        if not actions:
+            return pd.DataFrame(columns=["우선순위","문항","등급","p(정답률)","pbis","D","원인","담당","개선 액션","산출물"])
+
+        df = pd.DataFrame(actions)
+        # 보기 좋게 반올림
+        df["p(정답률)"] = pd.to_numeric(df["p(정답률)"], errors="coerce").round(3)
+        df["pbis"]      = pd.to_numeric(df["pbis"], errors="coerce").round(3)
+        df["D"]         = pd.to_numeric(df["D"], errors="coerce").round(3)
+
+        # 우선순위 정렬
+        order = {"P0(즉시)":0, "P1(이번 회차 내)":1, "P2(다음 회차)":2, "P2(모니터링)":3}
+        df["_ord"] = df["우선순위"].map(order).fillna(99)
+        df = df.sort_values(["_ord","등급","p(정답률)"], ascending=[True, True, True]).drop(columns=["_ord"])
+        return df
+
+    action_df = make_actions(item_stats, cfg)
+    if len(action_df):
+        st.dataframe(action_df, use_container_width=True)
+    else:
+        st.success("현재 기준에서 즉시 조치가 필요한 문항이 감지되지 않았습니다.")
+
+    # -----------------------------------------------
+    # 5-5) 메신저용 자동 보고(2월만 / 선택 월)
+    # -----------------------------------------------
+    st.subheader("5-5) 메신저용 자동 보고(복붙용)")
+
+    # 선택 월(기본: 최신 month_key)
+    if "month" in base.columns:
+        month_options = (
+            base[["month","month_key"]]
+            .dropna()
+            .drop_duplicates()
+            .sort_values("month_key")["month"]
+            .tolist()
+        )
+    else:
+        month_options = []
+
+    chosen_month = None
+    if month_options:
+        chosen_month = st.selectbox("보고 기준 월 선택", options=month_options, index=len(month_options)-1)
+        base_m = base[base["month"] == chosen_month].copy()
+    else:
+        base_m = base.copy()
+        chosen_month = "해당월"
+
+    n_m = int(base_m["total_score"].notna().sum())
+    mean_m = float(base_m["total_score"].mean()) if n_m else np.nan
+    p80_m  = float((base_m["total_score"] >= 80).mean()) if n_m else np.nan
+
+    # 월 기준으로 문항 통계 재계산(정확도를 위해)
+    # (주의: item_score_df는 전체 기준이므로, 월 필터에 맞춰 다시 만들기)
+    idx_m = base_m.index
+    item_m = item_score_df.loc[idx_m].copy()
+    total_m = base_m["total_score"]
+
+    item_rows_m = []
+    for i, q in enumerate(qcols, start=1):
+        pts   = points[q]
+        sc    = item_m[q]
+        ratio = sc / pts if pts > 0 else np.nan
+        p_value = float(ratio.mean())
+        total_excl = total_m - sc.fillna(0)
+        pb    = point_biserial(sc, total_excl)
+        D     = top_bottom_D(sc, total_excl)
+        grade, reason = risk_grade(p_value, pb, D, cfg)
+        item_rows_m.append({"q": q.replace("_score",""), "p_value": p_value, "pbis": pb, "D": D, "risk_grade": grade})
+
+    item_m_stats = pd.DataFrame(item_rows_m)
+    alpha_m = cronbach_alpha(item_m.fillna(0))
+
+    # 핵심 수치
+    neg_D = item_m_stats[pd.to_numeric(item_m_stats["D"], errors="coerce") < 0]
+    neg_pb = item_m_stats[pd.to_numeric(item_m_stats["pbis"], errors="coerce") < 0]
+    warn_hold = item_m_stats[item_m_stats["risk_grade"].isin(["HOLD","WARN"])]
+
+    # 메시지 템플릿(짧고 숫자 기반)
+    lines = []
+    lines.append(f"센터장님, {chosen_month} 직무테스트 데이터를 기준으로 빠르게 점검해봤습니다.")
+    if np.isfinite(mean_m):
+        lines.append(f"- {chosen_month} 평균: {mean_m:.1f}점 (n={n_m})")
+    if np.isfinite(p80_m):
+        lines.append(f"- {chosen_month} 80점 이상 비율: {p80_m*100:.1f}%")
+    if pd.notna(alpha_m):
+        lines.append(f"- 시험 신뢰도(α): {alpha_m:.2f} (0.6+ 권장)")
+    if len(neg_D) or len(neg_pb):
+        # 대표 역전 수치 1~2개만 노출
+        ex = []
+        if len(neg_D):
+            r0 = neg_D.sort_values("D").iloc[0]
+            ex.append(f"{r0['q']} D={float(r0['D']):.3f}")
+        if len(neg_pb):
+            r1 = neg_pb.sort_values("pbis").iloc[0]
+            ex.append(f"{r1['q']} pbis={float(r1['pbis']):.3f}")
+        lines.append(f"- 일부 문항에서 상·하위 정답률 역전/역변별 징후: " + ", ".join(ex))
+        lines.append("→ 문항/채점 구조 점검(정답키·오탈자·복수정답·부분점수 기준) 우선 권고드립니다.")
+    else:
+        lines.append("- 상·하위 역전(음수 변별) 징후는 뚜렷하지 않습니다.")
+
+    if len(warn_hold):
+        top = warn_hold.sort_values(["risk_grade","p_value"]).head(3)["q"].tolist()
+        lines.append(f"- 리스크 문항(WARN/HOLD) 상위: {', '.join(top)}")
+        lines.append("→ 리스크 문항은 우선 조치(P0/P1)로 검토 후 다음 회차에 반영하는 게 안전합니다.")
+
+    msg = "\n".join(lines)
+    st.text_area("복붙용 메시지", value=msg, height=220)
+
+    st.download_button(
+        "메신저 보고 텍스트 다운로드(.txt)",
+        data=msg.encode("utf-8"),
+        file_name=f"report_{chosen_month}.txt",
+        mime="text/plain",
+    )
     # -----------------------------
     # 6) 시뮬레이션
     # -----------------------------
