@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 import re
 from io import StringIO
+from typing import Optional
+
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -30,10 +32,10 @@ def split_by_separator(raw: str):
     raw = str(raw).strip()
     if not raw:
         return []
-    # split when a line equals 'ㅡㅡ' (allow spaces)
     parts = re.split(r"\n\s*ㅡㅡ\s*\n", raw)
     parts = [p.strip() for p in parts if p and p.strip()]
     return parts
+
 
 def detect_sep(text: str) -> str:
     """Auto-detect delimiter: prefer tab if tab appears in header."""
@@ -41,27 +43,23 @@ def detect_sep(text: str) -> str:
     if not lines:
         return "\t"
     first = lines[0]
-    # if many tabs, it's TSV
     if first.count("\t") >= max(2, first.count(",")):
         return "\t"
     return ","
 
-def read_pasted_table(text: str) -> pd.DataFrame | None:
+
+def read_pasted_table(text: str) -> Optional[pd.DataFrame]:
     """Read CSV/TSV pasted text. Robust to extra spaces."""
     if text is None:
         return None
     t = str(text).strip()
     if not t:
         return None
-
-    # Remove obvious non-table blocks (keep until a new header like '응답자ID' if mixed)
-    # We'll still parse what we can.
     sep = detect_sep(t)
     try:
         df = pd.read_csv(StringIO(t), sep=sep)
         return df
     except Exception:
-        # fallback: try tab then comma
         for s in ["\t", ","]:
             try:
                 df = pd.read_csv(StringIO(t), sep=s)
@@ -70,39 +68,33 @@ def read_pasted_table(text: str) -> pd.DataFrame | None:
                 continue
         raise ValueError("붙여넣은 텍스트를 표(CSV/TSV)로 파싱할 수 없습니다. (탭/쉼표 구분 확인)")
 
+
 def clean_cols(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df.columns = [re.sub(r"\s+", " ", str(c)).strip() for c in df.columns]
     return df
 
+
 def try_num(s: pd.Series) -> pd.Series:
     return pd.to_numeric(s, errors="coerce")
 
+
 def base_num(colname: str):
-    """
-    Column like '1', '1.1', '1.2' ... -> base number 1..10
-    """
     s = str(colname).strip()
     m = re.match(r"^(10|[1-9])(\..+)?$", s)
     if not m:
         return None
     return int(m.group(1))
 
+
 def suffix_key(colname: str):
-    """
-    '1' -> ''
-    '1.1' -> '.1'
-    """
     s = str(colname).strip()
     if "." in s:
         return s[s.find("."):]
     return ""
 
-def pick_best_itemscore_group(df: pd.DataFrame, n_items=10):
-    """
-    Choose the best 1..10 column group that looks like item scores.
-    Data has repeated 1..10 columns; pandas makes them 1,2..10, 1.1..10.1, ...
-    """
+
+def pick_best_itemscore_group(df: pd.DataFrame, n_items: int = 10):
     cols = list(df.columns)
     numbered = [c for c in cols if base_num(c) is not None]
     if not numbered:
@@ -124,11 +116,9 @@ def pick_best_itemscore_group(df: pd.DataFrame, n_items=10):
         numeric = sub.apply(try_num)
         numeric_rate = np.isfinite(numeric.values).mean()
 
-        # score plausibility: mostly within 0..10 (allow partial like 2.5/7.5/8)
         in_range = ((numeric >= 0) & (numeric <= 10)).to_numpy()
         range_rate = np.nanmean(in_range)
 
-        # Typical item score group: high numeric_rate & high range_rate
         score = cover * 10 + numeric_rate * 5 + range_rate * 5
         if score > best_score:
             best_score = score
@@ -138,11 +128,8 @@ def pick_best_itemscore_group(df: pd.DataFrame, n_items=10):
     gcols_sorted = sorted(gcols, key=lambda c: base_num(c))
     return sk, gcols_sorted
 
+
 def cronbach_alpha(item_df: pd.DataFrame) -> float:
-    """
-    Cronbach's alpha on item scores (numeric).
-    Works best when items are comparable scale.
-    """
     x = item_df.astype(float).dropna(axis=0, how="any")
     if x.shape[0] < 3 or x.shape[1] < 2:
         return np.nan
@@ -152,6 +139,7 @@ def cronbach_alpha(item_df: pd.DataFrame) -> float:
     if total_var == 0:
         return np.nan
     return float((k / (k - 1)) * (1 - item_vars.sum() / total_var))
+
 
 def point_biserial(item_score: pd.Series, total_excl: pd.Series) -> float:
     x = pd.to_numeric(item_score, errors="coerce")
@@ -163,7 +151,8 @@ def point_biserial(item_score: pd.Series, total_excl: pd.Series) -> float:
         return np.nan
     return float(np.corrcoef(df["x"], df["y"])[0, 1])
 
-def top_bottom_D(item_score: pd.Series, total_excl: pd.Series, frac=0.27) -> float:
+
+def top_bottom_D(item_score: pd.Series, total_excl: pd.Series, frac: float = 0.27) -> float:
     x = pd.to_numeric(item_score, errors="coerce")
     y = pd.to_numeric(total_excl, errors="coerce")
     df = pd.DataFrame({"x": x, "y": y}).dropna()
@@ -176,12 +165,8 @@ def top_bottom_D(item_score: pd.Series, total_excl: pd.Series, frac=0.27) -> flo
     high = df.tail(k)["x"].mean()
     return float(high - low)
 
+
 def risk_grade(p, pbis, D, cfg):
-    """
-    Simple operational grading:
-    - HOLD: p < p_hold
-    - WARN: p < p_warn_low or p > p_too_easy or pbis < pb_warn or D < D_warn
-    """
     reasons = []
     grade = "OK"
 
@@ -213,13 +198,10 @@ def risk_grade(p, pbis, D, cfg):
         reasons = ["-"]
     return grade, "; ".join(reasons)
 
+
 def stdize_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Standardize core columns if exist.
-    """
     df = df.copy()
     rename = {}
-    # common korean -> canonical
     mapping = {
         "고유번호": "uid",
         "월": "month",
@@ -236,11 +218,11 @@ def stdize_columns(df: pd.DataFrame) -> pd.DataFrame:
     df = df.rename(columns=rename)
     return df
 
+
 def month_sort_key(m):
     if pd.isna(m):
         return "9999-99"
     s = str(m)
-    # formats like '2026년 1월' or '2026년1월'
     s2 = re.sub(r"\s+", "", s)
     m1 = re.match(r"(\d{4})년(\d{1,2})월", s2)
     if m1:
@@ -248,6 +230,7 @@ def month_sort_key(m):
         mm = int(m1.group(2))
         return f"{y:04d}-{mm:02d}"
     return s
+
 
 # -----------------------------
 # Sidebar thresholds
@@ -267,7 +250,7 @@ with st.expander("입력 안내(당신이 올릴 데이터 형태 기준)", expa
         """
 - **박스1(메인)**: `고유번호/월/팀/직무/상담사/입사일/근속개월/점수` + `1~10` 반복 컬럼(문항점수/정오표/OX/텍스트 등) 포함 테이블을 그대로 붙여넣기  
 - **박스2(선택)**: `응답자ID...`로 시작하는 구글폼 원본 응답 테이블(선택, 분석 근거/예시 표시용)  
-- 앱은 **1~10이 반복되는 컬럼 중 “숫자(0~10/부분점수)가 가장 잘 파싱되는 그룹”을 자동으로 문항점수로 선택**합니다.
+- 앱은 **1~10이 반복되는 컬럼 중 "숫자(0~10/부분점수)가 가장 잘 파싱되는 그룹"을 자동으로 문항점수로 선택**합니다.
         """
     )
 
@@ -300,7 +283,6 @@ if run:
         st.error("박스1(메인 테이블)이 비어 있습니다.")
         st.stop()
 
-    # Section split (in case user pasted multiple blocks into main_text)
     main_parts = split_by_separator(main_text)
     main_block = main_parts[0] if main_parts else main_text.strip()
 
@@ -308,18 +290,15 @@ if run:
     df_main = clean_cols(df_main)
     df_main = stdize_columns(df_main)
 
-    # Identify best item-score group from repeated 1..10 columns
     suffix, score_cols = pick_best_itemscore_group(df_main, n_items=10)
 
     if not score_cols or len(score_cols) < 10:
         st.error("메인 테이블에서 1~10 문항 컬럼 그룹(점수)을 자동 식별하지 못했습니다. 컬럼명이 1~10 형태인지 확인해주세요.")
         st.stop()
 
-    # Allow user to override which group to use
     st.subheader("2) 문항점수(1~10) 그룹 자동 선택 결과")
     st.write(f"자동 선택된 그룹 suffix: `{suffix if suffix else '(no suffix)'}`, 컬럼: {score_cols}")
 
-    # List all candidate groups to allow manual selection
     numbered = [c for c in df_main.columns if base_num(c) is not None]
     groups = {}
     for c in numbered:
@@ -331,34 +310,32 @@ if run:
         "원하면 다른 1~10 그룹으로 변경",
         options=group_keys,
         format_func=lambda k: group_label_map[k],
-        index=group_keys.index(suffix) if suffix in group_keys else 0
+        index=group_keys.index(suffix) if suffix in group_keys else 0,
     )
     score_cols = sorted(groups[chosen_key], key=lambda c: base_num(c))
 
-    # Build standardized item score df
     item_score_df = df_main[score_cols].copy()
     item_score_df = item_score_df.apply(try_num)
 
-    # If total_score column absent, compute
     if "total_score" not in df_main.columns:
         df_main["total_score"] = item_score_df.sum(axis=1, min_count=1)
 
     df_main["total_score"] = pd.to_numeric(df_main["total_score"], errors="coerce")
 
-    # Standardize item names Q1..Q10
     qcols = [f"Q{i}_score" for i in range(1, 11)]
     item_score_df.columns = qcols
 
-    # Estimate per-item max points (default max observed; fallback 10)
     points = {}
     for q in qcols:
         mx = float(np.nanmax(item_score_df[q].values)) if np.isfinite(item_score_df[q].values).any() else 10.0
         points[q] = mx if mx > 0 else 10.0
 
-    # Merge base columns
-    base_cols = [c for c in ["uid", "month", "team", "role", "name", "hire_date", "tenure_group", "total_score"] if c in df_main.columns]
+    base_cols = [
+        c for c in ["uid", "month", "team", "role", "name", "hire_date", "tenure_group", "total_score"]
+        if c in df_main.columns
+    ]
     base = df_main[base_cols].copy()
-    # ensure month sort key
+
     if "month" in base.columns:
         base["month_key"] = base["month"].map(month_sort_key)
     else:
@@ -366,23 +343,19 @@ if run:
         base["month_key"] = "NA"
 
     # -----------------------------
-    # KPI (overall + by month)
+    # KPI
     # -----------------------------
     st.subheader("3) KPI 대시보드 (시험 직후 자동 모니터링 6개)")
 
-    # overall
     n = int(base["total_score"].notna().sum())
     mean_ = float(base["total_score"].mean())
     median_ = float(base["total_score"].median())
     std_ = float(base["total_score"].std(ddof=1)) if n > 1 else np.nan
     p80 = float((base["total_score"] >= 80).mean())
     pass_rate = float((base["total_score"] >= cfg["cut_score"]).mean())
-    low40 = float((base["total_score"] < 40).mean())
 
     alpha = cronbach_alpha(item_score_df.fillna(0))
 
-    # item stats (later) needs p_value etc; placeholder now
-    # seg gap (team x role)
     seg_gap = np.nan
     if "team" in base.columns and "role" in base.columns:
         seg = base.dropna(subset=["team", "role", "total_score"]).copy()
@@ -392,7 +365,7 @@ if run:
             if len(means) >= 2:
                 seg_gap = float(means.max() - means.min())
 
-    # compute item stats
+    # Item stats
     item_rows = []
     total = base["total_score"].copy()
 
@@ -415,13 +388,12 @@ if run:
             "pbis": pb,
             "D": D,
             "risk_grade": grade,
-            "reasons": reason
+            "reasons": reason,
         })
 
     item_stats = pd.DataFrame(item_rows)
-    item_fail_rate = float(item_stats["risk_grade"].isin(["HOLD"]).mean())  # operationally: HOLD is immediate risk
+    item_fail_rate = float(item_stats["risk_grade"].isin(["HOLD"]).mean())
 
-    # KPI 6 tiles
     k1, k2, k3, k4, k5, k6 = st.columns(6)
     k1.metric("평균", f"{mean_:.2f}", help="전체 평균(총점)")
     k2.metric("중앙값", f"{median_:.2f}", help="중앙값(총점)")
@@ -430,7 +402,6 @@ if run:
     k5.metric("문항 HOLD 비율", f"{item_fail_rate*100:.1f}%", help="HOLD(반영보류 권고) 문항 비율")
     k6.metric("세그 격차", f"{seg_gap:.1f}" if pd.notna(seg_gap) else "-", help="팀×직무 평균 max-min")
 
-    # distribution charts
     cA, cB = st.columns([1.2, 1.0])
     with cA:
         fig = px.histogram(base.dropna(subset=["total_score"]), x="total_score", nbins=12, title="총점 분포")
@@ -438,22 +409,44 @@ if run:
         st.plotly_chart(fig, use_container_width=True)
 
     with cB:
-        grade_counts = item_stats["risk_grade"].value_counts().reindex(["HOLD", "WARN", "OK"]).fillna(0).astype(int).reset_index()
+        grade_counts = (
+            item_stats["risk_grade"]
+            .value_counts()
+            .reindex(["HOLD", "WARN", "OK"])
+            .fillna(0)
+            .astype(int)
+            .reset_index()
+        )
         grade_counts.columns = ["risk_grade", "count"]
         fig2 = px.bar(grade_counts, x="risk_grade", y="count", title="문항 리스크 등급 분포")
         fig2.update_layout(height=320)
         st.plotly_chart(fig2, use_container_width=True)
 
     # -----------------------------
-    # Trend by month (if multiple months exist)
+    # Trend by month  ★ .values 버그 수정
     # -----------------------------
     st.subheader("4) 월별 트렌드(가능한 경우)")
     if "month" in base.columns and base["month"].nunique() >= 2:
-        trend = base.groupby(["month", "month_key"])["total_score"].agg(
-            n="count", mean="mean", median="median", std="std"
-        ).reset_index().sort_values("month_key")
-        trend["p80"] = base.groupby(["month", "month_key"]).apply(lambda g: (g["total_score"] >= 80).mean()).values
-        trend["pass_rate"] = base.groupby(["month", "month_key"]).apply(lambda g: (g["total_score"] >= cfg["cut_score"]).mean()).values
+        trend = (
+            base.groupby(["month", "month_key"])["total_score"]
+            .agg(n="count", mean="mean", median="median", std="std")
+            .reset_index()
+            .sort_values("month_key")
+        )
+
+        # ★ 수정: merge 방식으로 정렬 불일치 방지
+        p80_ser = (
+            base.groupby(["month", "month_key"])["total_score"]
+            .apply(lambda g: (g >= 80).mean())
+            .reset_index(name="p80")
+        )
+        pass_ser = (
+            base.groupby(["month", "month_key"])["total_score"]
+            .apply(lambda g: (g >= cfg["cut_score"]).mean())
+            .reset_index(name="pass_rate")
+        )
+        trend = trend.merge(p80_ser, on=["month", "month_key"], how="left")
+        trend = trend.merge(pass_ser, on=["month", "month_key"], how="left")
 
         t1, t2 = st.columns(2)
         with t1:
@@ -479,7 +472,7 @@ if run:
     show["D"] = show["D"].round(3)
     st.dataframe(
         show.sort_values(["risk_grade", "p_value"], ascending=[True, True]),
-        use_container_width=True
+        use_container_width=True,
     )
 
     hold_items = item_stats[item_stats["risk_grade"] == "HOLD"]
@@ -490,14 +483,17 @@ if run:
         )
 
     # -----------------------------
-    # Mean recovery simulation: remove HOLD items
+    # HOLD simulation
     # -----------------------------
     st.subheader("6) 원인분해(시험문항 영향도) 시뮬레이션: HOLD 문항 제외 시 평균 회복")
     hold_qs = set(hold_items["q"].tolist())
     if hold_qs:
-        # compute adjusted total: subtract those item scores and also subtract max points from denominator? we show raw score change only.
-        cols_map = {f"Q{i}": f"Q{i}_score" for i in range(1, 11)}
-        hold_score_cols = [cols_map[q] for q in hold_qs if q in cols_map]
+        # ★ 수정: 명시적 컬럼 매핑으로 KeyError 방지
+        hold_score_cols = [
+            f"Q{q[1:]}_score"
+            for q in hold_qs
+            if f"Q{q[1:]}_score" in item_score_df.columns
+        ]
         adj_total = base["total_score"] - item_score_df[hold_score_cols].sum(axis=1, min_count=1)
         st.write(
             f"- HOLD 문항: {sorted(list(hold_qs))}\n"
@@ -510,21 +506,34 @@ if run:
         st.info("HOLD 문항이 없어 시뮬레이션을 생략합니다.")
 
     # -----------------------------
-    # Segmentation: team/role/tenure
+    # Segmentation  ★ .values 버그 수정
     # -----------------------------
     st.subheader("7) 세그(팀/직무/근속) 구조 패턴")
-    seg_tabs = []
-    for col in ["team", "role", "tenure_group"]:
-        if col in base.columns:
-            seg_tabs.append(col)
+    seg_tabs = [col for col in ["team", "role", "tenure_group"] if col in base.columns]
 
     if seg_tabs:
         seg_choice = st.selectbox("세그 기준 선택", seg_tabs, index=0)
-        seg = base.dropna(subset=[seg_choice, "total_score"]).groupby(seg_choice)["total_score"].agg(
-            n="count", mean="mean", median="median", std="std"
-        ).reset_index().sort_values("mean")
-        seg["p80"] = base.dropna(subset=[seg_choice]).groupby(seg_choice).apply(lambda g: (g["total_score"] >= 80).mean()).values
-        seg["pass_rate"] = base.dropna(subset=[seg_choice]).groupby(seg_choice).apply(lambda g: (g["total_score"] >= cfg["cut_score"]).mean()).values
+        seg = (
+            base.dropna(subset=[seg_choice, "total_score"])
+            .groupby(seg_choice)["total_score"]
+            .agg(n="count", mean="mean", median="median", std="std")
+            .reset_index()
+            .sort_values("mean")
+        )
+
+        # ★ 수정: map 방식으로 정렬 불일치 방지
+        p80_map = (
+            base.dropna(subset=[seg_choice, "total_score"])
+            .groupby(seg_choice)["total_score"]
+            .apply(lambda g: (g >= 80).mean())
+        )
+        pass_map = (
+            base.dropna(subset=[seg_choice, "total_score"])
+            .groupby(seg_choice)["total_score"]
+            .apply(lambda g: (g >= cfg["cut_score"]).mean())
+        )
+        seg["p80"] = seg[seg_choice].map(p80_map)
+        seg["pass_rate"] = seg[seg_choice].map(pass_map)
 
         s1, s2 = st.columns([1.2, 1.0])
         with s1:
@@ -534,7 +543,6 @@ if run:
             figS.update_layout(height=360)
             st.plotly_chart(figS, use_container_width=True)
 
-        # team x role heatmap
         if "team" in base.columns and "role" in base.columns:
             pivot = base.pivot_table(index="team", columns="role", values="total_score", aggfunc="mean")
             figH = px.imshow(pivot, text_auto=True, aspect="auto", title="팀×직무 평균(총점) 히트맵")
@@ -547,9 +555,7 @@ if run:
     # Individual insights
     # -----------------------------
     st.subheader("8) 응답자별 인사이트(취약 문항 TOP3)")
-    # Compute top3 weakest items based on gap ratio
     indiv = base.copy()
-    # ratio gap per item
     gaps = []
     for i, q in enumerate(qcols, start=1):
         pts = points[q]
@@ -558,11 +564,12 @@ if run:
     gap_df = pd.concat(gaps, axis=1)
     gap_df.columns = [f"Q{i}_gap" for i in range(1, 11)]
 
-    # top3
+    # ★ 수정: row.get() 대신 안전한 인덱스 접근
     def top3_str(row):
         pairs = []
         for i in range(1, 11):
-            v = row.get(f"Q{i}_gap")
+            key = f"Q{i}_gap"
+            v = row[key] if key in row.index else np.nan
             if pd.isna(v):
                 continue
             pairs.append((i, float(v)))
@@ -573,11 +580,14 @@ if run:
 
     indiv["weak_top3"] = gap_df.apply(top3_str, axis=1)
 
-    show_cols = [c for c in ["month", "team", "role", "tenure_group", "name", "uid", "total_score", "weak_top3"] if c in indiv.columns]
+    show_cols = [
+        c for c in ["month", "team", "role", "tenure_group", "name", "uid", "total_score", "weak_top3"]
+        if c in indiv.columns
+    ]
     st.dataframe(indiv[show_cols].sort_values("total_score"), use_container_width=True)
 
     # -----------------------------
-    # Optional: parse form_text (display only)
+    # Optional: form_text
     # -----------------------------
     st.subheader("9) (선택) 구글폼 원본 응답 테이블 확인")
     if form_text.strip():
@@ -613,7 +623,6 @@ if run:
             mime="text/csv",
         )
     with d3:
-        # long scoring
         long = pd.DataFrame({"idx": np.arange(len(base))})
         for q in qcols:
             long[q.replace("_score", "")] = item_score_df[q]
